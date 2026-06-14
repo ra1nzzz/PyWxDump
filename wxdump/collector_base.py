@@ -143,7 +143,7 @@ def get_contacts(contact_conn) -> dict:
     contacts = {}
     try:
         rows = contact_conn.execute(
-            "SELECT userName, nickName, remark, type FROM Contact"
+            "SELECT username, nick_name, remark, local_type FROM Contact"
         ).fetchall()
         for row in rows:
             wxid = row[0]
@@ -329,3 +329,5 @@ def extract_media_metadata(msg_type: int, raw_content: str) -> dict:
         return extra
     except Exception:
         return {}
+
+
