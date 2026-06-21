@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import logging
 import shutil
 import tempfile
@@ -106,10 +107,14 @@ class SandboxRunner:
         logger.info("开始沙盒运行 | 级别=%s | 脚本=%s | 超时=%.1fs", self.level.value, script_path, self.timeout)
 
         try:
-            cmd = ["python", str(script_path)]
+            if getattr(sys, "frozen", False):
+                import shutil
+                py = shutil.which("python") or shutil.which("python3") or sys.executable
+            else:
+                py = sys.executable
+            cmd = [py, str(script_path)]
             if args:
                 cmd.extend(args)
-
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, cwd=work_dir, env=None,
@@ -136,7 +141,8 @@ class SandboxRunner:
             if not success:
                 logger.warning("脚本错误输出: %s", stderr[:500])
 
-            return SandboxResult(success=success, stdout=stdout, stderr=stderr, exit_code=exit_code, duration=elapsed, error=stderr if not success else None)
+            err = stderr if stderr.strip() else stdout if not success else None
+            return SandboxResult(success=success, stdout=stdout, stderr=stderr, exit_code=exit_code, duration=elapsed, error=err)
 
         except Exception as exc:
             elapsed = time.monotonic() - start_time
