@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""WeChat key extraction - 64-bit safe + robust process enumeration.
+"""WeChat key extraction - bundled with DustMirror.
 Supports WeChat 3.x (offset-based) and WeChat 4.x (memory pattern scanning).
 
 WeChat 3.x: Read encryption key at fixed offsets in WeChatWin.dll.
 WeChat 4.x: Scan process memory for x'<96hex>' patterns (SQLCipher key+salt),
             match against actual database file salts.
 
-Features:
+Fixes vs. original wx_dump.py:
   - CreateToolhelp32Snapshot.restype = c_void_p (prevent 64-bit handle truncation)
   - All Win32 API calls have explicit argtypes/restype for 64-bit safety
   - EnumProcesses fallback when ToolHelp32 snapshot fails
@@ -14,14 +14,17 @@ Features:
   - Weixin.dll support for WeChat 4.x
   - Per-database key+salt output (WeChat 4.x uses different keys per DB)
 """
-import ctypes,ctypes.wintypes,json,os,re,sys
+import ctypes,ctypes.wintypes,json,os,re,sys,hashlib,hmac,subprocess,tempfile,time,shutil
 from pathlib import Path
 
 # ── Constants ──
 T=2;M=260;P=0x1F0FFF
 WX_NAMES=("WeChat.exe","WeChatAppEx.exe","Weixin.exe","Wechat.exe","wechat.exe")
-WEIXIN_PROCS=("Weixin.exe",)  # 4.x processes
+WEIXIN_PROCS=("Weixin.exe","WeChatAppEx.exe")  # 4.x processes
 WECHAT3_PROCS=("WeChat.exe","Wechat.exe","wechat.exe")  # 3.x processes
+
+def dustmirror_cache_dir():
+ return os.getenv("PYWXDUMP_CACHE_DIR") or os.path.join(os.path.expanduser("~"),".dustmirror","pywxdump_cache")
 
 # ── Win32 API setup (64-bit safe) ──
 k=ctypes.WinDLL("kernel32",use_last_error=True)
@@ -206,6 +209,203 @@ def match_keys_to_dbs(candidates,db_salts):
    result[rel_path]={"enc_key":c["enc_key"],"salt":c["salt"]}
  return result
 
+def write_wx4_key_outputs(all_keys,user_dir_paths,primary_user,source_label):
+ """Write WeChat 4.x per-database keys in DustMirror/We-Insight format."""
+ keys_by_user={}
+ for full_key,info in all_keys.items():
+  user_dir,rel_path=full_key.split("/",1)
+  keys_by_user.setdefault(user_dir,{})[rel_path]=info
+ primary_keys=keys_by_user.get(primary_user) or {}
+ if not primary_keys:return False
+ primary_user_dir=user_dir_paths.get(primary_user,Path.home()/"Documents"/"xwechat_files"/primary_user)
+ primary_data_dir=primary_user_dir/"db_storage"
+ primary_keys_file=primary_user_dir/"all_keys.json"
+ cache_dir=dustmirror_cache_dir()
+ os.makedirs(cache_dir,exist_ok=True)
+ cache_path=os.path.join(cache_dir,"keys.json")
+ Path(cache_path).write_text(json.dumps(primary_keys,ensure_ascii=False,indent=2),encoding="utf-8")
+ print("[+] Saved %d keys to: %s"%(len(primary_keys),cache_path))
+ manifest_path=os.path.join(cache_dir,"manifest.json")
+ Path(manifest_path).write_text(json.dumps({
+  "wechat_db_dir":str(primary_data_dir),
+  "wechat_keys_file":str(primary_keys_file),
+  "primary_user":primary_user,
+  "source":source_label,
+ },ensure_ascii=False,indent=2),encoding="utf-8")
+ for user_dir,user_keys in keys_by_user.items():
+  user_data_dir=user_dir_paths.get(user_dir,Path.home()/"Documents"/"xwechat_files"/user_dir)
+  keys_path=user_data_dir/"all_keys.json"
+  keys_path.write_text(json.dumps(user_keys,ensure_ascii=False,indent=2),encoding="utf-8")
+  print("[+] Saved %d keys to: %s"%(len(user_keys),keys_path))
+ print("[*] Export complete.")
+ print("[*] WECHAT_DB_DIR=%s"%str(primary_data_dir))
+ print("[*] WECHAT_KEYS_FILE=%s"%str(primary_keys_file))
+ print("[+] Done!")
+ return True
+
+def find_message_oracle_db(db_storage):
+ """Find a message DB suitable for SQLCipher page-1 HMAC verification."""
+ preferred=("message/message_0.db","message/biz_message_0.db","msg/MSG0.db")
+ for rel_path in preferred:
+  candidate=db_storage/rel_path
+  if candidate.is_file():return candidate
+ for candidate in sorted(db_storage.rglob("*.db")):
+  rel=str(candidate.relative_to(db_storage)).replace("\\","/").lower()
+  if "message" in rel or rel.startswith("msg/"):return candidate
+ for candidate in sorted(db_storage.rglob("*.db")):
+  return candidate
+ return None
+
+def choose_primary_user(all_db_info,user_dir_paths,matched_counts=None):
+ """Choose the most likely active WeChat account directory."""
+ best_user=None
+ best_score=(-1,-1,-1,"")
+ for user_dir,salts in all_db_info.items():
+  db_storage=user_dir_paths.get(user_dir,Path.home()/"Documents"/"xwechat_files"/user_dir)/"db_storage"
+  has_oracle=1 if find_message_oracle_db(db_storage) else 0
+  matched=matched_counts.get(user_dir,0) if matched_counts else 0
+  score=(matched,has_oracle,len(salts),user_dir)
+  if score>best_score:
+   best_score=score
+   best_user=user_dir
+ return best_user
+
+def active_script_path():
+ """Locate the downloaded WeChat 4.1+ debugger extractor script."""
+ roots=[Path(__file__).resolve().parent,Path.cwd()]
+ env=os.getenv("PYWXDUMP_ACTIVE_SCRIPT")
+ if env:roots.insert(0,Path(env).resolve().parent)
+ for root in roots:
+  candidate=(Path(env) if env and root==Path(env).resolve().parent else root/"windows_wechat_get_key.ps1")
+  if candidate.is_file():return candidate
+ return None
+
+def powershell_exe():
+ found=shutil.which("powershell.exe")
+ if found:return found
+ system_root=os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot")
+ if system_root:
+  candidate=Path(system_root)/"System32"/"WindowsPowerShell"/"v1.0"/"powershell.exe"
+  if candidate.is_file():return str(candidate)
+ return "powershell.exe"
+
+def is_admin():
+ try:return bool(ctypes.windll.shell32.IsUserAnAdmin())
+ except Exception:return False
+
+def quote_ps_arg(value):
+ return "'" + str(value).replace("'","''") + "'"
+
+def run_active_wechat_script(db_path,timeout):
+ """Run the debugger extractor and return its transcript."""
+ script=active_script_path()
+ if not script:raise RuntimeError("windows_wechat_get_key.ps1 not found next to wx_dump.py")
+ stamp=time.time_ns()
+ temp_dir=Path(tempfile.gettempdir())
+ transcript=temp_dir/("dustmirror_wxkey_%s.txt"%stamp)
+ launcher=temp_dir/("dustmirror_wxkey_%s.ps1"%stamp)
+ inner="& %s -DbPath %s"%(quote_ps_arg(script),quote_ps_arg(db_path))
+ launcher_text=(
+  "$dustmirrorExit=0\r\n"
+  "Start-Transcript -Path %s -Force *> $null\r\n"
+  "try { %s } catch { Write-Host $_; $dustmirrorExit=1 }\r\n"
+  "Stop-Transcript *> $null\r\n"
+  "exit $dustmirrorExit\r\n"
+ )%(quote_ps_arg(transcript),inner)
+ launcher.write_bytes(b"\xef\xbb\xbf"+launcher_text.encode("utf-8"))
+ ps=powershell_exe()
+ env=os.environ.copy()
+ env["PYTHONUTF8"]="1"
+ try:
+  if is_admin():
+   cmd=[ps,"-NoProfile","-ExecutionPolicy","Bypass","-File",str(launcher)]
+  else:
+   outer=(
+    "Start-Process -FilePath %s -Verb RunAs -Wait -WindowStyle Normal "
+    "-ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',%s)"
+   )%(quote_ps_arg(ps),quote_ps_arg(launcher))
+   cmd=[ps,"-NoProfile","-ExecutionPolicy","Bypass","-Command",outer]
+  subprocess.run(cmd,timeout=timeout,env=env)
+  return transcript.read_text(encoding="utf-8",errors="replace") if transcript.exists() else ""
+ finally:
+  for path in (launcher,transcript):
+   try:path.unlink()
+   except OSError:pass
+
+def parse_active_master_key(text):
+ found=None
+ for match in re.finditer(r"(?:master key:|找到密钥:)\s*([0-9a-fA-F]{64})",text or ""):
+  found=match.group(1).lower()
+ return bytes.fromhex(found) if found else None
+
+def redact_key_text(text):
+ return re.sub(r"((?:master key:|找到密钥:)\s*)[0-9a-fA-F]{64}",r"\1<redacted>",text or "")
+
+def hmac_check_sqlcipher4(page_key,page1):
+ if not page_key or len(page_key)!=32 or not page1 or len(page1)<4096:return False
+ try:
+  mac_salt=bytes((b^0x3A) for b in page1[:16])
+  mac_key=hashlib.pbkdf2_hmac("sha512",page_key,mac_salt,2,dklen=32)
+  payload=page1[16:4096-64]+(1).to_bytes(4,"little")
+  digest=hmac.new(mac_key,payload,hashlib.sha512).digest()
+  return hmac.compare_digest(digest,page1[4096-64:4096])
+ except Exception:
+  return False
+
+def read_page1(db_path):
+ with open(db_path,"rb") as file_obj:
+  return file_obj.read(4096)
+
+def detect_master_key_mode(master_key,oracle_db):
+ page1=read_page1(oracle_db)
+ if hmac_check_sqlcipher4(master_key,page1):return "raw"
+ derived=hashlib.pbkdf2_hmac("sha512",master_key,page1[:16],256000,dklen=32)
+ if hmac_check_sqlcipher4(derived,page1):return "pbkdf2"
+ return "pbkdf2"
+
+def derive_db_key(master_key,salt_hex,mode):
+ if mode=="raw":return master_key.hex()
+ return hashlib.pbkdf2_hmac("sha512",master_key,bytes.fromhex(salt_hex),256000,dklen=32).hex()
+
+def export_active_wechat41_keys(all_db_info,user_dir_paths):
+ """Fallback for WeChat 4.1.10.31+ where plaintext key patterns are gone."""
+ if not all_db_info:
+  print("[!] No WeChat 4.x database salts available for active extraction.",file=sys.stderr)
+  return False
+ primary_user=choose_primary_user(all_db_info,user_dir_paths)
+ if not primary_user:
+  print("[!] No WeChat account directory available for active extraction.",file=sys.stderr)
+  return False
+ db_storage=user_dir_paths.get(primary_user,Path.home()/"Documents"/"xwechat_files"/primary_user)/"db_storage"
+ oracle_db=find_message_oracle_db(db_storage)
+ if not oracle_db:
+  print("[!] No message database found for active extraction HMAC verification.",file=sys.stderr)
+  return False
+ print("[*] Passive scan did not export keys; trying WeChat 4.1+ active extraction...",flush=True)
+ print("[*] A WeChat login/UAC prompt may appear. Log in to the target account, then wait.",flush=True)
+ timeout=int(float(os.getenv("PYWXDUMP_ACTIVE_TIMEOUT","900")))
+ try:
+  transcript=run_active_wechat_script(oracle_db,timeout)
+ except subprocess.TimeoutExpired:
+  print("[!] Active extraction timed out after %d seconds."%timeout,file=sys.stderr)
+  return False
+ except Exception as exc:
+  print("[!] Active extraction failed to start: %s"%exc,file=sys.stderr)
+  return False
+ master_key=parse_active_master_key(transcript)
+ if not master_key:
+  print("[!] Active extraction did not return a verified master key.",file=sys.stderr)
+  tail="\n".join(redact_key_text(transcript).strip().splitlines()[-20:])
+  if tail:print(tail,file=sys.stderr)
+  return False
+ mode=detect_master_key_mode(master_key,oracle_db)
+ print("[+] Active master key verified with %s mode."%mode,flush=True)
+ active_keys={}
+ for rel_path,salt_hex in all_db_info[primary_user].items():
+  active_keys["%s/%s"%(primary_user,rel_path)]={"enc_key":derive_db_key(master_key,salt_hex,mode),"salt":salt_hex}
+ print("[+]   %s: %d/%d databases derived"%(primary_user,len(active_keys),len(all_db_info[primary_user])))
+ return write_wx4_key_outputs(active_keys,user_dir_paths,primary_user,"active-wechat41-"+mode)
+
 # ── Main entry point ──
 def main():
  if sys.platform!="win32":print("[!] Windows only.");sys.exit(1)
@@ -218,24 +418,36 @@ def main():
   print("[*] ToolHelp32 found 0, trying EnumProcesses fallback...",flush=True)
   procs=gp_enum();src="EnumProcesses"
  if not procs:
-  ap=gp_debug()
-  print("[!] WeChat not found via ToolHelp32 or EnumProcesses.",file=sys.stderr)
-  print("[!] Found %d total processes."%len(ap),file=sys.stderr)
-  if not ap:
-   err=ctypes.get_last_error()
-   print("[!] CreateToolhelp32Snapshot likely failed (last_error=%s)."%(err,),file=sys.stderr)
-  for x in ap[:30]:print("  "+x,file=sys.stderr)
-  sys.exit(1)
- print("[+] Found %d process(es) via %s"%(len(procs),src))
+  pre_data_dirs=discover_wx_data_dirs()
+  if pre_data_dirs:
+   print("[*] WeChat process is not running; active WeChat 4.1+ extraction can launch it.",flush=True)
+  else:
+   ap=gp_debug()
+   print("[!] WeChat not found via ToolHelp32 or EnumProcesses.",file=sys.stderr)
+   print("[!] Found %d total processes."%len(ap),file=sys.stderr)
+   if not ap:
+    err=ctypes.get_last_error()
+    print("[!] CreateToolhelp32Snapshot likely failed (last_error=%s)."%(err,),file=sys.stderr)
+   for x in ap[:30]:print("  "+x,file=sys.stderr)
+   sys.exit(1)
+ if procs:print("[+] Found %d process(es) via %s"%(len(procs),src))
 
  # Classify processes
  wx4_pids=[(pid,nm) for pid,nm in procs if nm in WEIXIN_PROCS]
  wx3_pids=[(pid,nm) for pid,nm in procs if nm in WECHAT3_PROCS]
+ data_dirs=discover_wx_data_dirs()
+
+ # WeChat 4.x often runs as WeChatAppEx.exe; if data dir exists but no 4.x PID
+ # was classified, scan any non-3.x WeChat process.
+ if data_dirs and not wx4_pids:
+  wx4_pids=[(pid,nm) for pid,nm in procs if nm in WX_NAMES and nm not in WECHAT3_PROCS]
 
  # ── Try WeChat 4.x approach first ──
- if wx4_pids:
-  print("[*] Detected WeChat 4.x (Weixin.exe) processes",flush=True)
-  data_dirs=discover_wx_data_dirs()
+ if wx4_pids or data_dirs:
+  if wx4_pids:
+   print("[*] Detected WeChat 4.x processes: %s"%", ".join(sorted({nm for _,nm in wx4_pids})),flush=True)
+  else:
+   print("[*] Detected WeChat 4.x data directories; passive scan skipped until WeChat is running.",flush=True)
   if not data_dirs:
    print("[!] No WeChat 4.x data directories found under Documents/xwechat_files/",file=sys.stderr)
   else:
@@ -243,10 +455,12 @@ def main():
 
   # Collect all DB salts from all directories
   all_db_info={}  # {user_dir_name: {rel_path: salt_hex}}
+  user_dir_paths={}
   for dd in data_dirs:
    salts=get_db_salts(dd/"db_storage")
    if salts:
     all_db_info[dd.name]=salts
+    user_dir_paths[dd.name]=dd
     print("[+]   %s: %d databases"%(dd.name,len(salts)))
 
   # Scan all Weixin.exe processes for key patterns
@@ -263,15 +477,20 @@ def main():
    if cands:print("[+]   PID %d: %d patterns (%d unique, %d total unique)"%(pid,len(cands),new,len(seen)))
 
   if not all_candidates:
-   print("[!] No key patterns found in WeChat 4.x memory.",file=sys.stderr)
-   print("[!] This may indicate WeChat 4.1+ which doesn't cache all keys.",file=sys.stderr)
+   if wx4_pids:
+    print("[!] No key patterns found in WeChat 4.x memory.",file=sys.stderr)
+    print("[!] This may indicate WeChat 4.1+ which doesn't cache all keys.",file=sys.stderr)
+   else:
+    print("[*] No running WeChat 4.x process was available for passive key scan.",flush=True)
   else:
    print("[+] Total unique key+salt candidates: %d"%len(all_candidates))
 
   # Match candidates against all DB directories
   all_keys={}  # {user_dir/rel_path: {enc_key, salt}}
+  matched_counts={}
   for user_dir,salts in all_db_info.items():
    matched=match_keys_to_dbs(all_candidates,salts)
+   matched_counts[user_dir]=len(matched)
    for rel_path,info in matched.items():
     full_key="%s/%s"%(user_dir,rel_path)
     all_keys[full_key]=info
@@ -282,43 +501,18 @@ def main():
 
   if all_keys:
    # Determine the primary (matched) user directory
-   primary_user=next(iter(set(k.split("/")[0] for k in all_keys)),None)
+   primary_user=choose_primary_user(all_db_info,user_dir_paths,matched_counts)
    print("[+] Primary account: %s (%d keys)"%(primary_user,len(all_keys)))
+   if write_wx4_key_outputs(all_keys,user_dir_paths,primary_user,"passive-memory"):
+    return
 
-   # Build output: keys indexed by relative DB path (compatible with We-Insight/DustMirror)
-   keys_output={}
-   for full_key,info in all_keys.items():
-    user_dir,rel_path=full_key.split("/",1)
-    keys_output[rel_path]=info
-
-   # Also build a per-user-dir output for multi-account support
-   keys_by_user={}
-   for full_key,info in all_keys.items():
-    user_dir,rel_path=full_key.split("/",1)
-    keys_by_user.setdefault(user_dir,{})[rel_path]=info
-
-   # Save to cache directory (for DustMirror)
-   cache_dir=os.path.join(os.path.expanduser("~"),".dustmirror","pywxdump_cache")
-   os.makedirs(cache_dir,exist_ok=True)
-   cache_path=os.path.join(cache_dir,"keys.json")
-   Path(cache_path).write_text(json.dumps(keys_output,ensure_ascii=False,indent=2),encoding="utf-8")
-   print("[+] Saved %d keys to: %s"%(len(keys_output),cache_path))
-
-   # Save all_keys.json to each matched user's data directory (for We-Insight)
-   for user_dir,user_keys in keys_by_user.items():
-    wx_files=Path.home()/"Documents"/"xwechat_files"
-    user_data_dir=wx_files/user_dir
-    keys_path=user_data_dir/"all_keys.json"
-    keys_path.write_text(json.dumps(user_keys,ensure_ascii=False,indent=2),encoding="utf-8")
-    print("[+] Saved %d keys to: %s"%(len(user_keys),keys_path))
-
-   # Also set environment variables for DustMirror's collector
-   primary_data_dir=Path.home()/"Documents"/"xwechat_files"/primary_user/"db_storage"
-   print("[*] Export complete.")
-   print("[*] WECHAT_DB_DIR=%s"%str(primary_data_dir))
-   print("[*] WECHAT_KEYS_FILE=%s"%str(Path.home()/"Documents"/"xwechat_files"/primary_user/"all_keys.json"))
-   print("[+] Done!")
+  if export_active_wechat41_keys(all_db_info,user_dir_paths):
    return
+
+ if (wx4_pids or data_dirs) and not wx3_pids:
+  print("[!] No decryptable WeChat 4.x database keys were exported.",file=sys.stderr)
+  print("[!] For WeChat 4.1+, approve the active extraction prompt and log in to the spawned WeChat window.",file=sys.stderr)
+  sys.exit(1)
 
  # ── Fall back to WeChat 3.x approach ──
  if wx3_pids or not wx4_pids:
@@ -341,10 +535,12 @@ def main():
    if key:break
 
   if not key:
-   print("[!] Key not found. Supported: %d versions (3.x only)."%len(W))
-   if wx4_pids:
-    print("[!] WeChat 4.x processes detected but memory scan found no matching keys.",file=sys.stderr)
-    print("[!] Only the currently active WeChat account has keys cached in memory.",file=sys.stderr)
+   print("[!] Key not found.",file=sys.stderr)
+   if wx4_pids or data_dirs:
+    print("[!] WeChat 4.x was detected but key extraction failed.",file=sys.stderr)
+    print("[!] Ensure the active account is logged in; only cached keys can be read from memory.",file=sys.stderr)
+   else:
+    print("[!] Supported WeChat 3.x versions: %d."%len(W),file=sys.stderr)
    sys.exit(1)
 
   nm=info.get("nickname")or info.get("account")or"unknown"
@@ -367,7 +563,7 @@ def main():
   if not keys:
    for db in["session/session.db","general/general.db","contact/contact.db","msg/MSG0.db"]:
     keys[db]={"enc_key":key,"salt":""}
-  cd=os.path.join(os.path.expanduser("~"),".dustmirror","pywxdump_cache")
+  cd=dustmirror_cache_dir()
   os.makedirs(cd,exist_ok=True)
   op=os.path.join(cd,"keys.json")
   Path(op).write_text(json.dumps(keys,ensure_ascii=False,indent=2),encoding="utf-8")
